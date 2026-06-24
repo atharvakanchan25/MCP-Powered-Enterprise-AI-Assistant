@@ -49,6 +49,25 @@ class Settings(BaseSettings):
     chunk_overlap: int = 64
     rag_top_k: int = 5
 
+    # Agent
+    agent_max_iterations: int = 10
+    agent_temperature: float = 0.1
+
+    # Tools — optional integrations
+    serpapi_key: str = ""
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    google_credentials_json: str = ""   # path to service-account JSON
+    slack_bot_token: str = ""
+
+    # Redis cache TTL
+    cache_ttl_seconds: int = 300
+
+    # Monitoring
+    enable_metrics: bool = True
+
 
 @lru_cache
 def get_settings() -> Settings:

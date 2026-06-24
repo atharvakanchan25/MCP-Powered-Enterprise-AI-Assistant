@@ -72,3 +72,20 @@ class AuditLog(Base, UUIDMixin, TimestampMixin):
     )
 
     user: Mapped["User"] = relationship(back_populates="audit_logs")  # noqa: F821
+
+
+class RequestLog(Base, UUIDMixin, TimestampMixin):
+    __tablename__ = "request_logs"
+
+    path: Mapped[str] = mapped_column(String(500), nullable=False, index=True)
+    method: Mapped[str] = mapped_column(String(10), nullable=False)
+    status_code: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
+    error_type: Mapped[str | None] = mapped_column(String(255), index=True)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )

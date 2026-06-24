@@ -1,4 +1,5 @@
 from sqlalchemy.ext.asyncio import AsyncSession
+import uuid
 
 from app.core.exceptions import ConflictError, UnauthorizedError
 from app.core.security import (
@@ -47,7 +48,7 @@ class AuthService:
         if payload.get("type") != "refresh":
             raise UnauthorizedError("Invalid token type")
 
-        user = await self.repo.get(payload["sub"])
+        user = await self.repo.get(uuid.UUID(payload["sub"]))
         if not user or not user.is_active:
             raise UnauthorizedError("User not found or disabled")
 

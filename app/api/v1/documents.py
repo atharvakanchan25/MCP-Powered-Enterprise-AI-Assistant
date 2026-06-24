@@ -51,8 +51,8 @@ async def upload_document(
         storage_path=str(storage_path),
         owner_id=user.id,
     )
-    # Fire-and-forget ingestion — runs after response is returned
-    asyncio.create_task(ingest_document(doc.id, db))
+    # Fire-and-forget ingestion — opens its own DB session
+    asyncio.create_task(ingest_document(doc.id))
     return doc
 
 

@@ -19,12 +19,12 @@ def verify_password(plain: str, hashed: str) -> bool:
     return pwd_context.verify(plain, hashed)
 
 
-def _create_token(subject: str, expires_delta: timedelta, extra: dict[str, Any] = {}) -> str:
+def _create_token(subject: str, expires_delta: timedelta, extra: dict[str, Any] | None = None) -> str:
     payload = {
         "sub": subject,
         "exp": datetime.now(timezone.utc) + expires_delta,
         "iat": datetime.now(timezone.utc),
-        **extra,
+        **(extra or {}),
     }
     return jwt.encode(payload, settings.secret_key, algorithm=settings.jwt_algorithm)
 

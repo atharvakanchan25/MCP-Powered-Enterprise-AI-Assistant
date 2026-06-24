@@ -1,10 +1,12 @@
 from dataclasses import dataclass
+import hashlib
 
 from openai import AsyncOpenAI
 
 from app.core.config import get_settings
 from app.rag.embedder import embed_query
 from app.rag.vector_store import SearchResult, search
+from app.services.cache.redis_cache import cache
 
 
 @dataclass
@@ -40,9 +42,15 @@ async def semantic_search(
     top_k: int | None = None,
     filters: dict | None = None,
 ) -> list[Citation]:
+    cache_key = f"sem:{hashlib.md5(query.encode()).hexdigest()}:{top_k}"
+    cached = await cache.get(cache_key)
+    if cached:
+        return [Citation(**c) for c in cached]
     vector = await embed_query(query)
     hits = await search(vector, top_k=top_k, filters=filters)
-    return _build_citations(hits)
+    result = _build_citations(hits)
+    await cache.set(cache_key, [c.__dict__ for c in result])
+    return result
 
 
 async def query_knowledge_base(
@@ -50,6 +58,14 @@ async def query_knowledge_base(
     filters: dict | None = None,
     top_k: int | None = None,
 ) -> QueryResult:
+    cache_key = f"kb:{hashlib.md5(query.encode()).hexdigest()}"
+    cached = await cache.get(cache_key)
+    if cached:
+        return QueryResult(
+            answer=cached["answer"],
+            citations=[Citation(**c) for c in cached["citations"]],
+        )
+
     settings = get_settings()
     vector = await embed_query(query)
     hits = await search(vector, top_k=top_k or settings.rag_top_k, filters=filters)
@@ -81,7 +97,9 @@ async def query_knowledge_base(
         temperature=0.2,
     )
 
-    return QueryResult(
+    result = QueryResult(
         answer=response.choices[0].message.content or "",
         citations=citations,
     )
+    await cache.set(cache_key, {"answer": result.answer, "citations": [c.__dict__ for c in citations]})
+    return result
