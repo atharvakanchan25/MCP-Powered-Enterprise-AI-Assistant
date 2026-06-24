@@ -29,6 +29,26 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
 
+    # OpenAI
+    openai_api_key: str = ""
+    openai_embedding_model: str = "text-embedding-3-small"
+    openai_chat_model: str = "gpt-4o"
+    embedding_dimension: int = 1536
+
+    # Qdrant
+    qdrant_host: str = "qdrant"
+    qdrant_port: int = 6333
+    qdrant_collection: str = "mcp_documents"
+
+    # Storage
+    upload_dir: str = "uploads"
+    max_upload_size_mb: int = 50
+
+    # RAG
+    chunk_size: int = 512
+    chunk_overlap: int = 64
+    rag_top_k: int = 5
+
 
 @lru_cache
 def get_settings() -> Settings:
