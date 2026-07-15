@@ -4,3 +4,4 @@
 - **Atharva Kanchan** (atharvakanchan25) - Collaborator
 
 *This project is built using the MCP framework.*
+*Contributions are welcome via pull requests.*
