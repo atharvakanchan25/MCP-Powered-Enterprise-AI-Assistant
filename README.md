@@ -31,6 +31,387 @@ Think of it as an AI coworker that has access to your stack.
 
 ---
 
+## Architecture
+
+### System Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              USER / BROWSER                                 │
+│                         http://localhost:3000                               │
+└──────────────────────────────────┬──────────────────────────────────────────┘
+                                   │  HTTP / REST
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        NEXT.JS 14 FRONTEND                                  │
+│                                                                             │
+│   ┌──────────┐  ┌───────────┐  ┌────────┐  ┌────────┐  ┌───────┐  ┌─────┐ │
+│   │   Chat   │  │ Documents │  │ Vision │  │ Memory │  │ Admin │  │ ... │ │
+│   └──────────┘  └───────────┘  └────────┘  └────────┘  └───────┘  └─────┘ │
+│                                                                             │
+│   Zustand (state)  ·  Axios (API client)  ·  Tailwind CSS                  │
+└──────────────────────────────────┬──────────────────────────────────────────┘
+                                   │  HTTP/JSON  (JWT Bearer token)
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         FASTAPI BACKEND  :8000                              │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Middleware Layer                                                    │   │
+│  │  CORSMiddleware  ·  AuditMiddleware (request logging + X-Request-ID)│   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  API Routes  /api/v1/                                                │   │
+│  │                                                                      │   │
+│  │  POST /auth/register    POST /auth/login    POST /auth/refresh       │   │
+│  │  POST /agent/query      GET  /conversations  GET /conversations/{id} │   │
+│  │  POST /documents/upload GET  /documents      DELETE /documents/{id}  │   │
+│  │  POST /vision/analyze   GET  /memory         DELETE /memory/{id}     │   │
+│  │  GET  /admin/users      GET  /admin/logs     GET  /admin/stats       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  GET /health   ·   GET /metrics (Prometheus)                                │
+└──────────────────────────────────┬──────────────────────────────────────────┘
+                                   │
+                    ┌──────────────┼──────────────┐
+                    │              │              │
+                    ▼              ▼              ▼
+          ┌──────────────┐  ┌──────────┐  ┌──────────────┐
+          │  Agent       │  │  RAG     │  │  Auth /      │
+          │  Orchestrator│  │  Service │  │  User Service│
+          └──────┬───────┘  └────┬─────┘  └──────────────┘
+                 │               │
+                 ▼               ▼
+```
+
+### LangGraph Agent Pipeline
+
+Every query to `POST /api/v1/agent/query` flows through this 6-node pipeline:
+
+```
+                        ┌─────────────────────────────────────────────────────┐
+                        │              AgentState (shared context)            │
+                        │  query · user_id · conversation_id · memories       │
+                        │  plan · selected_tools · tool_results · rag_context │
+                        │  citations · final_answer · token_usage · errors    │
+                        └─────────────────────────────────────────────────────┘
+
+  ┌───────┐
+  │ START │
+  └───┬───┘
+      │
+      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  1. PLANNER NODE                                                            │
+│                                                                             │
+│  • Receives: user query + available MCP tools + existing memories           │
+│  • Calls GPT-4o with JSON mode                                              │
+│  • Outputs: step-by-step plan, list of selected_tools, reasoning[]          │
+│                                                                             │
+│  Example output:                                                            │
+│    plan: "1. Search web for X  2. Query DB for Y  3. Send Slack summary"   │
+│    selected_tools: ["web_search", "postgresql", "slack"]                    │
+└──────────────────────────────────┬──────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  2. RESEARCH NODE                                                           │
+│                                                                             │
+│  • Checks if "web_search" is in selected_tools                              │
+│  • If yes → calls MCPClient → WebSearchTool → SerpAPI → Google results     │
+│  • If no  → passes through immediately (no-op)                              │
+│  • Appends result to tool_results[]                                         │
+└──────────────────────────────────┬──────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  3. TOOL NODE                                                               │
+│                                                                             │
+│  • Iterates over selected_tools, skipping "web_search" and "rag_query"     │
+│  • For each tool: calls GPT-4o to extract JSON arguments from the plan     │
+│  • Dispatches to MCPClient → ToolRegistry → concrete MCPTool.execute()     │
+│                                                                             │
+│  Available MCP Tools:                                                       │
+│  ┌─────────────────┬────────────────────────────────────────────────────┐  │
+│  │ web_search      │ Google search via SerpAPI                          │  │
+│  │ postgresql      │ Read-only SELECT queries on your Postgres DB       │  │
+│  │ email           │ Send emails via SMTP (Gmail, etc.)                 │  │
+│  │ google_sheets   │ Read from / append rows to Google Sheets           │  │
+│  │ slack           │ Post messages or read channel history              │  │
+│  └─────────────────┴────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  Each tool extends MCPTool (abstract base):                                 │
+│    name · description · parameters (JSON Schema) · execute() · safe_execute│
+│  safe_execute() wraps execute() with error handling + duration tracking     │
+└──────────────────────────────────┬──────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  4. RAG NODE                                                                │
+│                                                                             │
+│  • Embeds the user query with text-embedding-3-small (OpenAI)              │
+│  • Runs semantic_search() against Qdrant vector store                      │
+│  • Returns top-K chunks: filename · page · score · excerpt                 │
+│  • Populates rag_context[] and citations[] in state                        │
+└──────────────────────────────────┬──────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  5. MEMORY NODE                                                             │
+│                                                                             │
+│  • Surfaces existing user memories loaded at pipeline start                │
+│  • Actual memory writes happen post-pipeline in the orchestrator           │
+│  • MemoryService stores key/value facts per user, typed by:                │
+│      AGENT · CONVERSATION · USER_PROFILE                                   │
+└──────────────────────────────────┬──────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  6. REPORT NODE                                                             │
+│                                                                             │
+│  • Collects: plan + tool_results + rag_context + reasoning                 │
+│  • Calls GPT-4o to synthesize a final structured answer with citations     │
+│  • Writes final_answer and token_usage to state                            │
+└──────────────────────────────────┬──────────────────────────────────────────┘
+                                   │
+                                   ▼
+                               ┌───────┐
+                               │  END  │
+                               └───────┘
+
+  Post-pipeline (Orchestrator):
+  • Persists assistant Message + ToolCall traces to PostgreSQL
+  • Stores query as a CONVERSATION memory via MemoryService
+  • Records token usage via MonitoringService → request_logs table
+```
+
+### RAG Pipeline (Document Ingestion)
+
+```
+  User uploads file (PDF / DOCX / PPTX / XLSX / TXT / image)
+         │
+         ▼
+  ┌─────────────────┐
+  │  File Parser    │  pypdf · python-docx · python-pptx · openpyxl
+  │  (app/rag/      │  → extracts raw text + page metadata
+  │   parsers/)     │
+  └────────┬────────┘
+           │
+           ▼
+  ┌─────────────────┐
+  │  Chunker        │  LangChain RecursiveCharacterTextSplitter
+  │  (chunker.py)   │  chunk_size=512, overlap=64 tokens
+  └────────┬────────┘
+           │
+           ▼
+  ┌─────────────────┐
+  │  Embedder       │  OpenAI text-embedding-3-small → 1536-dim vectors
+  │  (embedder.py)  │
+  └────────┬────────┘
+           │
+           ▼
+  ┌─────────────────┐
+  │  Qdrant         │  Upserts vectors with payload:
+  │  Vector Store   │  { filename, page, chunk_index, excerpt, user_id }
+  └─────────────────┘
+
+  At query time:
+  query → embed → Qdrant cosine search → top-K chunks → rag_context
+```
+
+### Data Layer
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                        PostgreSQL                                │
+  │                                                                  │
+  │  users          id · email · username · hashed_password · role  │
+  │                 is_active · is_verified                          │
+  │                                                                  │
+  │  conversations  id · title · status · user_id                   │
+  │                                                                  │
+  │  messages       id · role · content · token_count · conv_id     │
+  │                 role ∈ {user, assistant, system, tool}           │
+  │                                                                  │
+  │  tool_calls     id · tool_name · input_args · output · error    │
+  │                 duration_ms · message_id                         │
+  │                                                                  │
+  │  memories       id · key · value · relevance_score              │
+  │                 user_id · conversation_id                        │
+  │                                                                  │
+  │  documents      id · filename · content_type · status           │
+  │                 chunk_count · storage_path · owner_id            │
+  │                                                                  │
+  │  audit_logs     id · action · resource_type · ip_address        │
+  │                 user_id · meta                                   │
+  │                                                                  │
+  │  request_logs   id · path · method · status_code · duration_ms  │
+  │                 prompt_tokens · completion_tokens · user_id      │
+  └──────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                          Redis                                   │
+  │  • Response caching (TTL = 300s by default)                      │
+  │  • Session / token management                                    │
+  └──────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                          Qdrant                                  │
+  │  • Collection: mcp_documents                                     │
+  │  • 1536-dim vectors (text-embedding-3-small)                     │
+  │  • Cosine similarity search                                      │
+  │  • Payload: filename · page · chunk_index · excerpt · user_id   │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+### MCP Tool Layer
+
+```
+  MCPTool (abstract base)
+  ├── name: str
+  ├── description: str
+  ├── parameters: dict  (JSON Schema — exposed to LLM for arg extraction)
+  ├── execute(**kwargs) → ToolResult          ← implement this
+  └── safe_execute(**kwargs) → ToolResult     ← wraps execute() with try/except + timing
+
+  ToolResult
+  └── tool_name · success · output · error · duration_ms · metadata
+
+  ToolRegistry (singleton)
+  ├── register(tool)
+  ├── get(name) → MCPTool
+  ├── all_tools() → list[MCPTool]
+  ├── discover(query) → keyword match on name/description
+  └── to_openai_functions() → OpenAI function-calling schema list
+
+  MCPClient
+  ├── list_tools() → OpenAI function schemas (fed to planner LLM)
+  ├── discover(query) → tool name list
+  └── execute(tool_name, **kwargs) → ToolResult
+```
+
+### Security & Observability
+
+```
+  Auth
+  ├── JWT access tokens (HS256, 30 min expiry)
+  ├── Refresh tokens (7 day expiry)
+  ├── Passwords hashed with bcrypt (passlib)
+  └── Role-based access: admin · manager · user · viewer
+
+  Middleware
+  ├── CORSMiddleware — configurable allowed origins
+  └── AuditMiddleware — logs every request: method · path · status · duration
+                        injects X-Request-ID and X-Response-Time headers
+
+  Monitoring
+  ├── Prometheus metrics exposed at GET /metrics
+  ├── prometheus-fastapi-instrumentator — auto-instruments all routes
+  └── MonitoringService — writes per-request token usage to request_logs
+
+  Logging
+  └── structlog — structured JSON logs with context binding
+```
+
+### Full Component Map
+
+```
+mcp-assistant/
+│
+├── app/
+│   ├── main.py                  FastAPI app factory, lifespan, middleware setup
+│   │
+│   ├── api/v1/                  HTTP route handlers
+│   │   ├── auth.py              register · login · refresh · me
+│   │   ├── agent.py             POST /query → run_agent()
+│   │   ├── conversations.py     CRUD for conversations + messages
+│   │   ├── documents.py         upload · list · delete · status
+│   │   ├── vision.py            image upload → GPT-4o vision analysis
+│   │   └── admin.py             users · audit logs · token stats
+│   │
+│   ├── agents/
+│   │   ├── state.py             AgentState TypedDict (shared pipeline context)
+│   │   ├── nodes.py             6 async node functions (planner→report)
+│   │   └── workflow.py          LangGraph StateGraph wiring + compiled singleton
+│   │
+│   ├── mcp/
+│   │   ├── base.py              MCPTool ABC + ToolResult dataclass
+│   │   ├── registry.py          ToolRegistry singleton
+│   │   ├── client.py            MCPClient (list/discover/execute)
+│   │   ├── __init__.py          register_all_tools() called at startup
+│   │   └── tools/
+│   │       ├── web_search.py    SerpAPI Google search
+│   │       ├── postgresql.py    Read-only SQL execution
+│   │       ├── email_tool.py    SMTP email sending
+│   │       ├── google_sheets.py Sheets read/append via service account
+│   │       └── slack.py         Slack post/read via Bot Token
+│   │
+│   ├── rag/
+│   │   ├── parsers/             PDF · DOCX · PPTX · XLSX · TXT parsers
+│   │   ├── chunker.py           RecursiveCharacterTextSplitter wrapper
+│   │   ├── embedder.py          OpenAI text-embedding-3-small
+│   │   ├── vector_store.py      Qdrant upsert/search
+│   │   └── storage.py           Local file storage for uploads
+│   │
+│   ├── services/
+│   │   ├── agent/
+│   │   │   ├── orchestrator.py  run_agent(): loads memory → invokes workflow → persists results
+│   │   │   └── memory.py        MemoryService: store/recall/get_user_profile
+│   │   ├── rag/
+│   │   │   ├── ingestion.py     Full doc ingestion pipeline (parse→chunk→embed→store)
+│   │   │   ├── query.py         semantic_search() used by rag_node
+│   │   │   └── vision.py        GPT-4o image analysis
+│   │   ├── cache/
+│   │   │   └── redis_cache.py   get/set/delete with TTL
+│   │   ├── reports/
+│   │   │   └── generator.py     ReportLab PDF generation from agent output
+│   │   ├── auth.py              JWT creation/verification, user auth logic
+│   │   ├── audit.py             AuditLog writes
+│   │   └── monitoring.py        MonitoringService: record_request() → request_logs
+│   │
+│   ├── models/
+│   │   ├── user.py              User · UserRole
+│   │   ├── conversation.py      Conversation · Message · MessageRole
+│   │   └── domain.py            Document · Memory · ToolCall · AuditLog · RequestLog
+│   │
+│   ├── core/
+│   │   ├── config.py            Pydantic Settings (reads .env)
+│   │   ├── security.py          JWT helpers, password hashing
+│   │   ├── logging.py           structlog setup
+│   │   └── exceptions.py        Custom exception classes + FastAPI handlers
+│   │
+│   ├── db/
+│   │   ├── session.py           SQLAlchemy async engine + session factory
+│   │   └── redis.py             Redis async client
+│   │
+│   ├── middleware/
+│   │   └── audit.py             AuditMiddleware (request/response logging)
+│   │
+│   └── repositories/
+│       ├── base.py              Generic async CRUD repository
+│       └── user.py              UserRepository (email/username lookups)
+│
+├── frontend/src/
+│   ├── app/
+│   │   ├── chat/page.tsx        Chat interface with message history
+│   │   ├── documents/page.tsx   File upload + document list
+│   │   ├── vision/page.tsx      Image upload + GPT-4o analysis
+│   │   ├── memory/page.tsx      View + delete stored memories
+│   │   ├── settings/page.tsx    User profile + API key config
+│   │   └── admin/page.tsx       User management + audit logs + token stats
+│   ├── components/Sidebar.tsx   Navigation sidebar
+│   ├── hooks/useAuth.ts         Auth state + JWT refresh logic
+│   └── lib/api.ts               Axios instance with auth interceptors
+│
+├── alembic/                     Database migration scripts
+├── tests/                       pytest suite (auth · RAG · parsers · vision)
+├── docker-compose.yml           api · postgres · redis · qdrant
+└── Dockerfile                   Multi-stage Python image
+```
+
+---
+
 ## Tech stack
 
 **Backend**
@@ -48,23 +429,6 @@ Think of it as an AI coworker that has access to your stack.
 - [Next.js 14](https://nextjs.org/) (App Router) + TypeScript
 - [Tailwind CSS](https://tailwindcss.com/)
 - Pages: Chat, Documents, Memory, Vision, Settings, Admin
-
----
-
-## How the agent works
-
-Every query goes through a 6-node LangGraph pipeline:
-
-```
-planner → research → tool → rag → memory → report
-```
-
-1. **Planner** — reads your query and available tools, outputs a step-by-step plan and selects which tools to use
-2. **Research** — runs a web search if needed
-3. **Tool** — executes all other selected tools (Slack, email, Sheets, SQL, etc.) with LLM-extracted arguments
-4. **RAG** — queries Qdrant for relevant chunks from your uploaded documents
-5. **Memory** — surfaces existing memories about you for context
-6. **Report** — synthesizes everything into a structured final answer with citations
 
 ---
 

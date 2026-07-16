@@ -53,9 +53,9 @@ async def test_query_knowledge_base_no_results():
 
 async def test_analyze_image_unsupported_type(tmp_path):
     from app.core.exceptions import AppException
-    f = tmp_path / "file.bmp"
+    f = tmp_path / "file.tiff"
     f.write_bytes(b"\x00" * 10)
-    # .bmp is not in SUPPORTED_IMAGE_TYPES
+    # .tiff is not in SUPPORTED_IMAGE_TYPES
     with pytest.raises(AppException) as exc_info:
         await analyze_image(f, task=VisionTask.GENERAL)
     assert exc_info.value.status_code == 415

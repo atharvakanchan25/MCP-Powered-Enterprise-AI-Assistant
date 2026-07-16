@@ -1,5 +1,5 @@
 # ── Web Framework ────────────────────────────────────────────────────────────
-fastapi==0.111.0
+fastapi>=0.115.0
 uvicorn[standard]==0.29.0
 
 # ── Database ─────────────────────────────────────────────────────────────────
@@ -16,7 +16,7 @@ passlib[bcrypt]==1.7.4
 python-multipart==0.0.9
 
 # ── Validation & Settings ────────────────────────────────────────────────────
-pydantic==2.7.1
+pydantic==2.8.2
 pydantic-settings==2.2.1
 email-validator==2.1.1
 
@@ -52,6 +52,9 @@ reportlab==4.2.0
 
 # ── Monitoring ───────────────────────────────────────────────────────────────
 prometheus-fastapi-instrumentator==7.0.0
+
+# ── Optional Tool Integrations ───────────────────────────────────────────────
+google-auth==2.29.0
 
 # ── Dev / Test ───────────────────────────────────────────────────────────────
 pytest==8.2.0
